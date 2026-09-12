@@ -1,6 +1,6 @@
 name: "PerfectDraft Card Renderer"
 description: "Renders PerfectDraft dashboard cards for Waveshare Spectra 6 E-Ink Display"
-version: "1.0.31_2"
+version: "1.0.31_3"
 slug: "perfectdraft_card_renderer"
 init: false
 startup: "application"
