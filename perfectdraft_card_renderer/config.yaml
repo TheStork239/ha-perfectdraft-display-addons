@@ -1,8 +1,11 @@
 name: "PerfectDraft Card Renderer"
 description: "Renders PerfectDraft dashboard cards for Waveshare Spectra 6 E-Ink Display"
-version: "1.0.28"
+version: "1.0.29"
 slug: "perfectdraft_card_renderer"
 init: false
+startup: "application"
+map:
+  - config:rw
 arch:
   - aarch64
   - amd64
