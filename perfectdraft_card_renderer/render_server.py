@@ -14,6 +14,8 @@ DEBUG_RAW = "/config/www/debug_raw_card.png"
 DEBUG_PATH = "/config/www/debug_screenshot.png"
 AUTH_CACHE = "/data/auth_state.json"
 
+BANNER_WIDTH = 234
+
 PALETTE = [
     0,   0,   0,      # 0: Black
     255, 255, 255,    # 1: White
@@ -73,7 +75,7 @@ def render_card(beer_override=None):
         try:
             page.goto(target_url, wait_until="networkidle", timeout=30000)
 
-            # Re-authenticate if session dropped or redirected to auth
+            # Re-authenticate if session dropped
             needs_auth = False
             try:
                 user_input = page.locator("input[name='username']").first
@@ -100,7 +102,6 @@ def render_card(beer_override=None):
             card = page.locator("perfectdraft-card, perfectdraft-pro-card, ha-card").first
             card.wait_for(state="visible", timeout=20000)
 
-            # Dynamically override the beer in browser memory if requested
             if beer_override:
                 card.evaluate("""(el, name) => {
                     const cfg = Object.assign({}, el._config || {}, { beer_name: name });
@@ -123,8 +124,8 @@ def render_card(beer_override=None):
     img = img.resize((600, 400), Image.Resampling.LANCZOS)
     px = img.load()
 
-    # Dynamic Brand Classification
-    sample_pts = [px[25, y] for y in (80, 130, 200, 270, 330)]
+    # 1. Sample Background from Safe Margin (top-left of banner, clear of text & keg)
+    sample_pts = [px[x, y] for x in (25, 35, 45) for y in (40, 60, 80)]
     avg_r = sum(p[0] for p in sample_pts) / len(sample_pts)
     avg_g = sum(p[1] for p in sample_pts) / len(sample_pts)
     avg_b = sum(p[2] for p in sample_pts) / len(sample_pts)
@@ -134,8 +135,9 @@ def render_card(beer_override=None):
     c_min = min(avg_r, avg_g, avg_b)
     chroma = c_max - c_min
 
+    # 2. Brand & Text Contrast Classification
     if chroma < 28:
-        if bg_lum < 75:
+        if bg_lum < 85:
             brand = "BLACK"
             brand_solid = (0, 0, 0)
             text_solid = (255, 255, 255)
@@ -151,11 +153,11 @@ def render_card(beer_override=None):
         else:
             hue = (60 * ((avg_r - avg_g) / chroma) + 240) % 360
 
-        if hue >= 330 or hue < 20:
+        if hue >= 330 or hue < 25:
             brand = "RED"
             brand_solid = (255, 0, 0)
             text_solid = (255, 255, 255)
-        elif 20 <= hue < 75:
+        elif 25 <= hue < 75:
             brand = "YELLOW"
             brand_solid = (255, 255, 0)
             text_solid = (0, 0, 0)
@@ -168,54 +170,61 @@ def render_card(beer_override=None):
             brand_solid = (0, 0, 255)
             text_solid = (255, 255, 255)
 
-    banner_width = 236
-    for test_x in range(190, 260):
-        r, g, b = px[test_x, 200]
-        if r > 245 and g > 245 and b > 245:
-            banner_width = test_x
-            break
+    print(f"Beer: {beer_override or 'Live'} | Brand: {brand} (Chroma: {chroma:.1f}, Lum: {bg_lum:.1f}) -> Solid: {brand_solid}", flush=True)
 
-    print(f"Beer: {beer_override or 'Live'} | Brand: {brand} (Chroma: {chroma:.1f}) -> Solid: {brand_solid}", flush=True)
-
+    # 3. Deterministic Image Processing
     for y in range(400):
-        bg_r, bg_g, bg_b = px[25, y]
         for x in range(600):
             r, g, b = px[x, y]
             lum = 0.299 * r + 0.587 * g + 0.114 * b
             px_chroma = max(r, g, b) - min(r, g, b)
 
-            if x < banner_width:
-                dist_bg = abs(r - bg_r) + abs(g - bg_g) + abs(b - bg_b)
-                if y >= 170:
+            if x < BANNER_WIDTH:
+                # Banner Region
+                if y >= 180:
+                    # Text & Icon Area
                     if text_solid == (0, 0, 0):
-                        is_text = (lum < 125 or (r < bg_r - 40 and g < bg_g - 40))
+                        # Black text on Yellow or White
+                        is_text = (lum < 130)
                     else:
-                        is_text = (lum > 135 or dist_bg > 55)
+                        # White text on Red, Green, Blue, or Black
+                        is_text = (min(r, g, b) > 130) or (lum > 150 and px_chroma < 45)
+                    
                     px[x, y] = text_solid if is_text else brand_solid
                 else:
-                    if x < 65 or x > 185 or y < 45:
+                    # Keg Header Area: preserve 3D keg body, clean background shoulders
+                    dist_bg = abs(r - avg_r) + abs(g - avg_g) + abs(b - avg_b)
+                    if x < 55 or x > 185 or y < 30:
                         px[x, y] = brand_solid
                     else:
-                        if dist_bg < 38:
+                        if dist_bg < 45 and px_chroma < 35:
                             px[x, y] = brand_solid
+            elif x == BANNER_WIDTH and brand == "WHITE":
+                # Clean vertical separation for all-white beer banners
+                px[x, y] = (0, 0, 0) if 20 <= y <= 380 else (255, 255, 255)
             else:
+                # Right Region: Glasses and Volume Text
                 if y > 310:
-                    px[x, y] = (0, 0, 0) if lum < 140 else (255, 255, 255)
-                elif r > 244 and g > 244 and b > 244:
+                    # Remaining Volume Text
+                    px[x, y] = (0, 0, 0) if lum < 150 else (255, 255, 255)
+                elif r > 240 and g > 240 and b > 240:
+                    # Pure white background
                     px[x, y] = (255, 255, 255)
                 else:
-                    if px_chroma < 30:
-                        dark_val = max(0, int(lum * 0.65))
+                    # Pint Glasses: boost beer liquid saturation, keep outlines crisp
+                    if px_chroma < 25:
+                        dark_val = max(0, int(lum * 0.60))
                         px[x, y] = (dark_val, dark_val, dark_val)
                     else:
-                        deep_r = min(255, int(r * 1.15))
+                        deep_r = min(255, int(r * 1.20))
                         deep_g = max(0, int(g * 0.90))
-                        deep_b = max(0, int(b * 0.40))
+                        deep_b = max(0, int(b * 0.35))
                         px[x, y] = (deep_r, deep_g, deep_b)
 
-    enhanced = ImageEnhance.Color(img).enhance(1.3)
-    enhanced = ImageEnhance.Contrast(enhanced).enhance(1.15)
-    enhanced = ImageEnhance.Sharpness(enhanced).enhance(1.3)
+    # 4. Color Vibrancy & E-Ink Quantization
+    enhanced = ImageEnhance.Color(img).enhance(1.25)
+    enhanced = ImageEnhance.Contrast(enhanced).enhance(1.10)
+    enhanced = ImageEnhance.Sharpness(enhanced).enhance(1.20)
 
     pal = Image.new("P", (1, 1))
     pal.putpalette(PALETTE)
@@ -223,6 +232,7 @@ def render_card(beer_override=None):
     quantized = enhanced.quantize(palette=pal, dither=Image.Dither.FLOYDSTEINBERG)
     quantized.convert("RGB").save(OUTPUT_PNG, "PNG")
 
+    # 5. Pack for Waveshare 7-Color Spectra 6 Format
     try:
         img_rot = quantized.transpose(Image.Transpose.ROTATE_270)
     except AttributeError:
