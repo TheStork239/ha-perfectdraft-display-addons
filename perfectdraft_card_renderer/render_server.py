@@ -8,31 +8,12 @@ from PIL import Image, ImageEnhance
 from playwright.sync_api import sync_playwright
 
 OPTIONS_PATH = "/data/options.json"
-
-# Base fallbacks (no hardcoded credentials)
-HA_URL = "http://127.0.0.1:8123"
-HA_USERNAME = ""
-HA_PASSWORD = ""
-TARGET_URL = f"{HA_URL}/dashboard-entertainment/0"
-
-# Load dynamic credentials from Home Assistant Configuration tab
-if os.path.exists(OPTIONS_PATH):
-    try:
-        with open(OPTIONS_PATH, "r") as f:
-            opts = json.load(f)
-            HA_USERNAME = opts.get("ha_username", "").strip()
-            HA_PASSWORD = opts.get("ha_password", "").strip()
-            TARGET_URL = opts.get("dashboard_url", TARGET_URL).strip()
-    except Exception as err:
-        print(f"Warning: Failed to parse {OPTIONS_PATH}: {err}", flush=True)
-
 OUTPUT_PNG = "/config/www/perfectdraft_card.png"
 OUTPUT_BIN = "/config/www/perfectdraft_card.bin"
 DEBUG_RAW = "/config/www/debug_raw_card.png"
 DEBUG_PATH = "/config/www/debug_screenshot.png"
 AUTH_CACHE = "/data/auth_state.json"
 
-# Spectra 6 Hardware Palette: Black, White, Yellow, Red, Blue, Green
 PALETTE = [
     0,   0,   0,      # 0: Black
     255, 255, 255,    # 1: White
@@ -43,16 +24,31 @@ PALETTE = [
 ] + [0] * (768 - 18)
 
 COLOR_MAP = {
-    0: 0x0,  # Black
-    1: 0x1,  # White
-    2: 0x2,  # Yellow
-    3: 0x3,  # Red
-    4: 0x5,  # Blue
-    5: 0x6   # Green
+    0: 0x0,
+    1: 0x1,
+    2: 0x2,
+    3: 0x3,
+    4: 0x5,
+    5: 0x6
 }
+
+def load_config():
+    opts = {}
+    if os.path.exists(OPTIONS_PATH):
+        try:
+            with open(OPTIONS_PATH, "r") as f:
+                opts = json.load(f)
+        except Exception as e:
+            print(f"Warning: Could not read options.json: {e}", flush=True)
+    
+    username = opts.get("ha_username", "kiosk").strip()
+    password = opts.get("ha_password", "").strip()
+    target_url = opts.get("dashboard_url", "http://homeassistant:8123/dashboard-entertainment/0").strip()
+    return username, password, target_url
 
 def render_card():
     os.makedirs(os.path.dirname(OUTPUT_PNG), exist_ok=True)
+    ha_username, ha_password, target_url = load_config()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -61,18 +57,12 @@ def render_card():
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-cache",
-                "--disk-cache-size=0"
+                "--disable-gpu"
             ]
         )
         context_args = {
             "viewport": {"width": 1280, "height": 800},
             "device_scale_factor": 2,
-            "extra_http_headers": {
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache"
-            }
         }
         if os.path.exists(AUTH_CACHE) and os.path.getsize(AUTH_CACHE) > 0:
             context_args["storage_state"] = AUTH_CACHE
@@ -81,32 +71,43 @@ def render_card():
         page = context.new_page()
 
         try:
-            page.goto(TARGET_URL, wait_until="domcontentloaded")
+            page.goto(target_url, wait_until="networkidle", timeout=30000)
 
-            if "auth" in page.url or page.locator("input[name='username']").is_visible():
-                user_in = page.locator("input[name='username']").first
-                user_in.wait_for(state="visible", timeout=8000)
-                user_in.fill(HA_USERNAME)
-                pass_in = page.locator("input[name='password']").first
-                pass_in.fill(HA_PASSWORD)
-                pass_in.press("Enter")
-                page.wait_for_timeout(3000)
-                page.goto(TARGET_URL, wait_until="domcontentloaded")
+            # Check if unauthenticated / redirected to login
+            needs_auth = False
+            try:
+                user_input = page.locator("input[name='username']").first
+                user_input.wait_for(state="visible", timeout=6000)
+                needs_auth = True
+            except Exception:
+                if "auth" in page.url:
+                    needs_auth = True
 
-            loading = page.locator("ha-init-page")
-            if loading.is_visible():
-                loading.wait_for(state="detached", timeout=30000)
+            if needs_auth:
+                print("Session expired or unauthenticated. Logging in...", flush=True)
+                user_input = page.locator("input[name='username']").first
+                user_input.fill(ha_username)
+                pass_input = page.locator("input[name='password']").first
+                pass_input.fill(ha_password)
+                pass_input.press("Enter")
 
-            page.wait_for_timeout(2000)
-            page.reload(wait_until="domcontentloaded")
-            page.wait_for_timeout(3500)
+                # Wait for login form to complete and redirect
+                user_input.wait_for(state="detached", timeout=15000)
+                page.wait_for_url(lambda u: "auth" not in u, timeout=15000)
+                page.wait_for_timeout(2000)
+                
+                if "/dashboard-entertainment" not in page.url:
+                    page.goto(target_url, wait_until="networkidle", timeout=30000)
 
-            card = page.locator("perfectdraft-card, ha-card:has-text('PerfectDraft'), ha-card:has-text('Perfect Draft')").first
+                context.storage_state(path=AUTH_CACHE)
+                print("Authenticated successfully and session cached.", flush=True)
+
+            # Wait for custom card to mount
+            card = page.locator("perfectdraft-card, perfectdraft-pro-card, ha-card").first
             card.wait_for(state="visible", timeout=20000)
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(1500)
 
             screenshot = card.screenshot()
-            context.storage_state(path=AUTH_CACHE)
         except Exception as err:
             page.screenshot(path=DEBUG_PATH)
             browser.close()
@@ -116,12 +117,11 @@ def render_card():
     with open(DEBUG_RAW, "wb") as f:
         f.write(screenshot)
 
-    # Load and scale to 600x400 landscape
     img = Image.open(io.BytesIO(screenshot)).convert("RGB")
     img = img.resize((600, 400), Image.Resampling.LANCZOS)
     px = img.load()
 
-    # --- 1. DYNAMIC BRAND CLASSIFICATION VIA HSV ---
+    # Dynamic Brand Classification
     sample_pts = [px[25, y] for y in (80, 130, 200, 270, 330)]
     avg_r = sum(p[0] for p in sample_pts) / len(sample_pts)
     avg_g = sum(p[1] for p in sample_pts) / len(sample_pts)
@@ -173,61 +173,44 @@ def render_card():
             banner_width = test_x
             break
 
-    print(f"Brand: {brand} (Chroma: {chroma:.1f}, Lum: {bg_lum:.1f}) -> Solid: {brand_solid}, Text: {text_solid}. Width: {banner_width}px", flush=True)
+    print(f"Brand: {brand} (Chroma: {chroma:.1f}, Lum: {bg_lum:.1f}) -> Solid: {brand_solid}. Width: {banner_width}px", flush=True)
 
-    # --- 2. ZONAL PRE-PROCESSING ---
     for y in range(400):
         bg_r, bg_g, bg_b = px[25, y]
-
         for x in range(600):
             r, g, b = px[x, y]
             lum = 0.299 * r + 0.587 * g + 0.114 * b
             px_chroma = max(r, g, b) - min(r, g, b)
 
-            # === LEFT BANNER (Flush Full-Bleed) ===
             if x < banner_width:
                 dist_bg = abs(r - bg_r) + abs(g - bg_g) + abs(b - bg_b)
-
-                # Zone A: Typography (y >= 170) -> Text vs. Solid Background
                 if y >= 170:
                     if text_solid == (0, 0, 0):
                         is_text = (lum < 125 or (r < bg_r - 40 and g < bg_g - 40))
                     else:
                         is_text = (lum > 135 or dist_bg > 55)
-
                     px[x, y] = text_solid if is_text else brand_solid
-
-                # Zone B: Keg Area (y < 170) -> Solid Background, Untouched Keg
                 else:
                     if x < 65 or x > 185 or y < 45:
                         px[x, y] = brand_solid
                     else:
                         if dist_bg < 38:
                             px[x, y] = brand_solid
-                        # Keg contours, handles, and label remain in RGB for dithering
-
-            # === RIGHT CANVAS (Beer Mugs & Volume Readout) ===
             else:
-                # Bottom text readout "9 x 568 mL" (y > 310)
                 if y > 310:
                     px[x, y] = (0, 0, 0) if lum < 140 else (255, 255, 255)
-                # Pure white canvas background
                 elif r > 244 and g > 244 and b > 244:
                     px[x, y] = (255, 255, 255)
                 else:
-                    # Glass handles, rims, reflections, and empty 10th glass (neutral tones)
                     if px_chroma < 30:
-                        # Darken neutral glass tones by ~35% for clean dithered contours
                         dark_val = max(0, int(lum * 0.65))
                         px[x, y] = (dark_val, dark_val, dark_val)
                     else:
-                        # Amber beer liquid: deepen contrast and saturation
                         deep_r = min(255, int(r * 1.15))
                         deep_g = max(0, int(g * 0.90))
                         deep_b = max(0, int(b * 0.40))
                         px[x, y] = (deep_r, deep_g, deep_b)
 
-    # --- 3. ENHANCEMENT & FLOYD-STEINBERG QUANTIZATION ---
     enhanced = ImageEnhance.Color(img).enhance(1.3)
     enhanced = ImageEnhance.Contrast(enhanced).enhance(1.15)
     enhanced = ImageEnhance.Sharpness(enhanced).enhance(1.3)
@@ -238,14 +221,12 @@ def render_card():
     quantized = enhanced.quantize(palette=pal, dither=Image.Dither.FLOYDSTEINBERG)
     quantized.convert("RGB").save(OUTPUT_PNG, "PNG")
 
-    # --- 4. ROTATION (270°) & BINARY PACKING ---
     try:
         img_rot = quantized.transpose(Image.Transpose.ROTATE_270)
     except AttributeError:
         img_rot = quantized.transpose(Image.ROTATE_270)
 
     raw_pixels = list(img_rot.getdata())
-
     packed_bytes = bytearray(len(raw_pixels) // 2)
     for i in range(0, len(raw_pixels), 2):
         c1 = COLOR_MAP.get(raw_pixels[i], 0x1)
@@ -255,7 +236,7 @@ def render_card():
     with open(OUTPUT_BIN, "wb") as f:
         f.write(packed_bytes)
 
-    print(f"Success: wrote {OUTPUT_PNG} and {OUTPUT_BIN} ({len(packed_bytes)} bytes)", flush=True)
+    print(f"Success: wrote {OUTPUT_PNG} and {OUTPUT_BIN}", flush=True)
 
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_POST(self):
