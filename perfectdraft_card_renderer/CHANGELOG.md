@@ -1,4 +1,14 @@
-# Changelog
+# Changeling
+
+## [1.0.31_6] - 2026-09-13
+
+### Added
+- Linked the add-on `url` metadata directly to the GitHub repository directory so the "visit the ... page for more information" link navigates to the project repo.
+- Embedded unified ISO timestamp logging across render workflows and HTTP request handling.
+
+### Fixed
+- Resolved syntax parsing collisions in `render_server.py`.
+- Enforced internal Docker network URL (`http://homeassistant:8123`) as the default dashboard target.
 
 ## 1.0.28
 - **UI Configuration**: Moved Home Assistant username, password, and dashboard URL to the native Add-on Configuration tab (`options.json`).
