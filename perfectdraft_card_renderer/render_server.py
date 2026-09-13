@@ -75,6 +75,231 @@ def render_card(beer_override=None):
         try:
             page.goto(target_url, wait_until="networkidle", timeout=30000)
 
+            # Re-authenticate if unauthenticated
+            needs_auth = False
+            try:
+                user_input = page.locator("input[name='username']").first
+                user_input.wait_for(state="visible", timeout=4000)
+                needs_auth = True
+            except Exception:
+                if "auth" in page.url:
+                    needs_auth = True
+
+            if needs_auth:
+                print("Session expired or unauthenticated. Logging in...", flush=True)
+                user_input = page.locator("input[name='username']").first
+                user_input.fill(ha_username)
+                pass_input = page.locator("input[name='password']").first
+                pass_input.fill(ha_password)
+                pass_input.press("Enter")
+                user_input.wait_for(state="detached", timeout=15000)
+                page.wait_for_url(lambda u: "auth" not in u, timeout=15000)
+                page.wait_for_timeout(2000)
+                if "/dashboard-entertainment" not in page.url:
+                    page.goto(target_url, wait_until="networkidle", timeout=30000)
+                context.storage_state(path=AUTH_CACHE)
+
+            card = page.locator("perfectdraft-card, perfectdraft-pro-card, ha-card").first
+            card.wait_for(state="visible", timeout=20000)
+
+            if beer_override:
+                card.evaluate("""(el, name) => {
+                    const cfg = Object.assign({}, el._config || {}, { beer_name: name });
+                    el.setConfig(cfg);
+                }""", beer_override)
+                page.wait_for_timeout(1200)
+
+            page.wait_for_timeout(600)
+            screenshot = card.screenshot()
+        except Exception as err:
+            page.screenshot(path=DEBUG_PATH)
+            browser.close()
+            raise err
+        browser.close()
+
+    with open(DEBUG_RAW, "wb") as f:
+        f.write(screenshot)
+
+    img = Image.open(io.BytesIO(screenshot)).convert("RGB")
+    img = img.resize((600, 400), Image.Resampling.LANCZOS)
+    px = img.load()
+
+    # 1. Sample Background from Safe Margin (x: 20..40, y: 60..100)
+    sample_pts = [px[x, y] for x in (20, 30, 40) for y in (60, 80, 100)]
+    avg_r = sum(p[0] for p in sample_pts) / len(sample_pts)
+    avg_g = sum(p[1] for p in sample_pts) / len(sample_pts)
+    avg_b = sum(p[2] for p in sample_pts) / len(sample_pts)
+
+    bg_lum = 0.299 * avg_r + 0.587 * avg_g + 0.114 * avg_b
+    c_max = max(avg_r, avg_g, avg_b)
+    c_min = min(avg_r, avg_g, avg_b)
+    chroma = c_max - c_min
+
+    # 2. Brand & Text Contrast Classification
+    if chroma < 28:
+        if bg_lum < 85:
+            brand = "BLACK"
+            brand_solid = (0, 0, 0)
+            default_text = (255, 255, 255)
+        else:
+            brand = "WHITE"
+            brand_solid = (255, 255, 255)
+            default_text = (0, 0, 0)
+    else:
+        if c_max == avg_r:
+            hue = (60 * ((avg_g - avg_b) / chroma) + 360) % 360
+        elif c_max == avg_g:
+            hue = (60 * ((avg_b - avg_r) / chroma) + 120) % 360
+        else:
+            hue = (60 * ((avg_r - avg_g) / chroma) + 240) % 360
+
+        if hue >= 330 or hue < 25:
+            brand = "RED"
+            brand_solid = (255, 0, 0)
+            default_text = (255, 255, 255)
+        elif 25 <= hue < 75:
+            brand = "YELLOW"
+            brand_solid = (255, 255, 0)
+            default_text = (0, 0, 0)
+        elif 75 <= hue < 165:
+            brand = "GREEN"
+            brand_solid = (0, 255, 0)
+            default_text = (255, 255, 255)
+        else:
+            brand = "BLUE"
+            brand_solid = (0, 0, 255)
+            default_text = (255, 255, 255)
+
+    print(f"Beer: {beer_override or 'Live'} | Brand: {brand} (Chroma: {chroma:.1f}, Lum: {bg_lum:.1f}) -> Solid: {brand_solid}", flush=True)
+
+    # 3. Deterministic Image Processing
+    for y in range(400):
+        for x in range(600):
+            r, g, b = px[x, y]
+            lum = 0.299 * r + 0.587 * g + 0.114 * b
+            px_chroma = max(r, g, b) - min(r, g, b)
+
+            if x < BANNER_WIDTH:
+                # Banner Region
+                if y >= 165:
+                    # Clean outer border radius margins
+                    if x < 12 or x > (BANNER_WIDTH - 8) or y > 388:
+                        px[x, y] = brand_solid
+                        continue
+
+                    # Contrast distance from the card's native background
+                    dist_bg = abs(r - avg_r) + abs(g - avg_g) + abs(b - avg_b)
+
+                    if dist_bg < 42:
+                        # Background pixel
+                        px[x, y] = brand_solid
+                    else:
+                        # Text / Icon pixel
+                        if brand == "YELLOW" or brand == "WHITE":
+                            px[x, y] = (0, 0, 0)
+                        else:
+                            # Dark/Saturated banners (Red, Green, Blue, Black)
+                            # 1. Check for Gold / Yellow branded fonts (Stella, Franziskaner, Singha, Spaten, Hertog Jan)
+                            if r > 130 and g > 105 and b < 105 and (r - b) > 35:
+                                px[x, y] = (255, 255, 0)
+                            # 2. Check for Red branded fonts (Trooper)
+                            elif r > 140 and g < 75 and b < 75:
+                                px[x, y] = (255, 0, 0)
+                            # 3. Standard White font & Snowflake icons
+                            else:
+                                px[x, y] = (255, 255, 255)
+                else:
+                    # Keg Header Area (y < 165)
+                    dist_bg = abs(r - avg_r) + abs(g - avg_g) + abs(b - avg_b)
+                    
+                    if x < 50 or x > 190 or y < 25:
+                        px[x, y] = brand_solid
+                    else:
+                        if brand == "WHITE":
+                            # Flush faint SVG shadow gradients to white
+                            if dist_bg < 60 and px_chroma < 30:
+                                px[x, y] = (255, 255, 255)
+                        else:
+                            if dist_bg < 45 and px_chroma < 35:
+                                px[x, y] = brand_solid
+            elif x == BANNER_WIDTH and brand == "WHITE":
+                # Clean 1px separation divider for white banners
+                px[x, y] = (0, 0, 0) if 10 <= y <= 390 else (255, 255, 255)
+            else:
+                # Right Panel: Glasses and Volume Text
+                if y > 310:
+                    px[x, y] = (0, 0, 0) if lum < 150 else (255, 255, 255)
+                elif r > 235 and g > 235 and b > 235:
+                    px[x, y] = (255, 255, 255)
+                else:
+                    # Pint glasses: boost liquid warmth, preserve outlines
+                    if px_chroma < 25:
+                        dark_val = max(0, int(lum * 0.60))
+                        px[x, y] = (dark_val, dark_val, dark_val)
+                    else:
+                        deep_r = min(255, int(r * 1.20))
+                        deep_g = max(0, int(g * 0.90))
+                        deep_b = max(0, int(b * 0.35))
+                        px[x, y] = (deep_r, deep_g, deep_b)
+
+    # 4. Color Vibrancy & E-Ink Quantization
+    enhanced = ImageEnhance.Color(img).enhance(1.25)
+    enhanced = ImageEnhance.Contrast(enhanced).enhance(1.10)
+    enhanced = ImageEnhance.Sharpness(enhanced).enhance(1.20)
+
+    pal = Image.new("P", (1, 1))
+    pal.putpalette(PALETTE)
+
+    quantized = enhanced.quantize(palette=pal, dither=Image.Dither.FLOYDSTEINBERG)
+    quantized.convert("RGB").save(OUTPUT_PNG, "PNG")
+
+    # 5. Pack for Waveshare 7-Color Spectra 6 Format
+    try:
+        img_rot = quantized.transpose(Image.Transpose.ROTATE_270)
+    except AttributeError:
+        img_rot = quantized.transpose(Image.ROTATE_270)
+
+    raw_pixels = list(img_rot.getdata())
+    packed_bytes = bytearray(len(raw_pixels) // 2)
+    for i in range(0, len(raw_pixels), 2):
+        c1 = COLOR_MAP.get(raw_pixels[i], 0x1)
+        c2 = COLOR_MAP.get(raw_pixels[i + 1], 0x1)
+        packed_bytes[i // 2] = (c1 << 4) | (c2 & 0x0F)
+
+    with open(OUTPUT_BIN, "wb") as f:
+        f.write(packed_bytes)
+
+class WebhookHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            beer_override = None
+            if content_length > 0:
+                body = self.rfile.read(content_length)
+                try:
+                    payload = json.loads(body.decode())
+                    beer_override = payload.get("beer_name")
+                except Exception:
+                    pass
+
+            render_card(beer_override=beer_override)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+        except Exception as e:
+            traceback.print_exc(file=sys.stderr)
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(str(e).encode())
+
+    def log_message(self, format, *args):
+        print(f"[HTTP] {format % args}", flush=True)
+
+if __name__ == "__main__":
+    server = HTTPServer(("0.0.0.0", 8099), WebhookHandler)
+    print("Renderer listening on port 8099...", flush=True)
+    server.serve_forever()            page.goto(target_url, wait_until="networkidle", timeout=30000)
+
             # Re-authenticate if session dropped
             needs_auth = False
             try:
