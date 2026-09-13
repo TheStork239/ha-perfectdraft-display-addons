@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.0.32] - 2026-09-13
+
+### Changed
+- **Rendering Engine Overhaul:** Replaced the fragile solid-color heuristic and legacy Floyd-Steinberg error diffusion with an **Edge-Preserving Atkinson Error Diffusion** pipeline. Error propagation is capped at 75% ($6/8$) with 25% discarded, preventing muddy midtone cascades and directional "worm" artifacts.
+- **Precomputed 3D Color LUT:** Introduced an in-memory $32 \times 32 \times 32$ perceptual color lookup table initialized at container startup, executing perceptually weighted Euclidean distance mapping ($2\Delta R^2 + 4\Delta G^2 + 3\Delta B^2$) across the 6-color Spectra palette in sub-second time.
+- **Edge-Gated Stroke Locking:** Integrated spatial edge detection (`ImageFilter.FIND_EDGES`) that halts error diffusion across font contours, temperature readouts, and icon glyphs (`edge > 30`), locking typography to solid, high-contrast palette values without grain or stroke erosion.
+- **Optimized Dynamic Range & Vibrancy:** Replaced heavy gamma lifting with a balanced tone curve: mild 5% shadow expansion ($\gamma = 1.05$), $1.25\times$ contrast acutance, and $1.35\times$ color boost. This renders pint glass borders in solid black, deepens amber beer fills, and prevents pastel background bleaching.
+
+### Removed
+- Removed all hardcoded pixel coordinate overrides, banner width splitting (`BANNER_WIDTH`), and color distance heuristics (`dist_bg`) that previously caused diagonal tears and inverted shadow wedges.
+
+### Fixed
+- Resolved washed-out white typography on light-colored cards (*Ginette Bio White*, *Leffe Blanche*) and dark slate banners (*Trooper Original*, *Camden Hells*).
+- Eliminated faint, indistinct glass borders in the serving counter column.
+- Fixed 3D barrel lighting clipping across all 114 catalog beers.
+
 ## [1.0.31_6] - 2026-09-13
 
 ### Added
