@@ -14,7 +14,7 @@ ports:
 options:
   ha_username: "kiosk"
   ha_password: ""
-  dashboard_url: "http://127.0.0.1:8123/dashboard-entertainment/0"
+  dashboard_url: "http://homeassistant:8123/dashboard-entertainment/0"
 schema:
   ha_username: str
   ha_password: password
