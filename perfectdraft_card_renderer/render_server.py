@@ -5,7 +5,7 @@ import json
 import traceback
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageFilter
 from playwright.sync_api import sync_playwright
 
 OPTIONS_PATH = "/data/options.json"
@@ -15,30 +15,56 @@ DEBUG_RAW = "/config/www/debug_raw_card.png"
 DEBUG_PATH = "/config/www/debug_screenshot.png"
 AUTH_CACHE = "/data/auth_state.json"
 
-BANNER_WIDTH = 234
-
-PALETTE = [
-    0,   0,   0,      # 0: Black
-    255, 255, 255,    # 1: White
-    255, 255, 0,      # 2: Yellow
-    255, 0,   0,      # 3: Red
-    0,   0,   255,    # 4: Blue
-    0,   255, 0       # 5: Green
-] + [0] * (768 - 18)
+# Waveshare 6-color Spectra Palette
+PALETTE_COLORS = [
+    (0, 0, 0),        # 0: Black
+    (255, 255, 255),  # 1: White
+    (255, 255, 0),    # 2: Yellow
+    (255, 0, 0),      # 3: Red
+    (0, 0, 255),      # 4: Blue
+    (0, 255, 0)       # 5: Green
+]
 
 COLOR_MAP = {
-    0: 0x0,
-    1: 0x1,
-    2: 0x2,
-    3: 0x3,
-    4: 0x5,
-    5: 0x6
+    0: 0x0,  # Black
+    1: 0x1,  # White
+    2: 0x2,  # Yellow
+    3: 0x3,  # Red
+    4: 0x5,  # Blue
+    5: 0x6   # Green
 }
 
 def log(message, level="INFO"):
-    """Print log message with timestamp and immediate flush."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] [{level}] {message}", flush=True)
+
+# Build a fast 32x32x32 perceptual color lookup table at startup
+log("Building 3D perceptual color LUT...")
+LUT = []
+for r_idx in range(32):
+    r_val = r_idx * 255 // 31
+    r_plane = []
+    for g_idx in range(32):
+        g_val = g_idx * 255 // 31
+        g_line = []
+        for b_idx in range(32):
+            b_val = b_idx * 255 // 31
+            best_idx = 0
+            best_dist = 99999999
+            for p_idx, (pr, pg, pb) in enumerate(PALETTE_COLORS):
+                # Perceptually weighted squared distance: Green > Red > Blue
+                dr = r_val - pr
+                dg = g_val - pg
+                db = b_val - pb
+                dist = 2 * dr * dr + 4 * dg * dg + 3 * db * db
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = p_idx
+            pr, pg, pb = PALETTE_COLORS[best_idx]
+            g_line.append((best_idx, pr, pg, pb))
+        r_plane.append(g_line)
+    LUT.append(r_plane)
+log("3D Color LUT initialized.")
 
 def load_config():
     opts = {}
@@ -53,6 +79,92 @@ def load_config():
     password = opts.get("ha_password", "").strip()
     target_url = opts.get("dashboard_url", "http://homeassistant:8123/dashboard-entertainment/0").strip()
     return username, password, target_url
+
+def edge_preserving_atkinson(img):
+    width, height = img.size
+    
+    # 1. Generate Edge Map to protect text and sharp outlines
+    gray = img.convert("L")
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    edge_data = list(edges.getdata())
+    
+    # 2. Extract and prepare float color buffers
+    pixels = list(img.getdata())
+    arr_r = [float(p[0]) for p in pixels]
+    arr_g = [float(p[1]) for p in pixels]
+    arr_b = [float(p[2]) for p in pixels]
+    
+    out_indices = [0] * (width * height)
+    
+    # 3. Atkinson Error Diffusion Loop
+    for y in range(height):
+        y_offset = y * width
+        for x in range(width):
+            idx = y_offset + x
+            
+            r = int(arr_r[idx])
+            g = int(arr_g[idx])
+            b = int(arr_b[idx])
+            
+            # Clamp bounds
+            if r < 0: r = 0
+            elif r > 255: r = 255
+            if g < 0: g = 0
+            elif g > 255: g = 255
+            if b < 0: b = 0
+            elif b > 255: b = 255
+            
+            # Map into LUT
+            ri = (r * 31) >> 8
+            gi = (g * 31) >> 8
+            bi = (b * 31) >> 8
+            
+            pal_idx, pr, pg, pb = LUT[ri][gi][bi]
+            out_indices[idx] = pal_idx
+            
+            # If on a high-contrast text or icon edge, skip error diffusion
+            # This locks font strokes and prevents speckle bleed
+            if edge_data[idx] > 38:
+                continue
+                
+            # Atkinson propagates 6/8ths (75%) of the error, discarding 25%
+            err_r = (r - pr) / 8.0
+            err_g = (g - pg) / 8.0
+            err_b = (b - pb) / 8.0
+            
+            # Neighbor diffusion
+            if x + 1 < width:
+                n = idx + 1
+                arr_r[n] += err_r; arr_g[n] += err_g; arr_b[n] += err_b
+            if x + 2 < width:
+                n = idx + 2
+                arr_r[n] += err_r; arr_g[n] += err_g; arr_b[n] += err_b
+                
+            if y + 1 < height:
+                row1 = (y + 1) * width
+                if x - 1 >= 0:
+                    n = row1 + x - 1
+                    arr_r[n] += err_r; arr_g[n] += err_g; arr_b[n] += err_b
+                n = row1 + x
+                arr_r[n] += err_r; arr_g[n] += err_g; arr_b[n] += err_b
+                if x + 1 < width:
+                    n = row1 + x + 1
+                    arr_r[n] += err_r; arr_g[n] += err_g; arr_b[n] += err_b
+                    
+            if y + 2 < height:
+                n = (y + 2) * width + x
+                arr_r[n] += err_r; arr_g[n] += err_g; arr_b[n] += err_b
+
+    # Build RGB dithered image
+    rgb_out = bytearray(width * height * 3)
+    for i, p_idx in enumerate(out_indices):
+        pr, pg, pb = PALETTE_COLORS[p_idx]
+        rgb_out[i * 3] = pr
+        rgb_out[i * 3 + 1] = pg
+        rgb_out[i * 3 + 2] = pb
+        
+    dithered_img = Image.frombytes("RGB", (width, height), bytes(rgb_out))
+    return dithered_img, out_indices
 
 def render_card(beer_override=None):
     os.makedirs(os.path.dirname(OUTPUT_PNG), exist_ok=True)
@@ -81,7 +193,7 @@ def render_card(beer_override=None):
         try:
             page.goto(target_url, wait_until="networkidle", timeout=30000)
 
-            # Re-authenticate if unauthenticated or on login page
+            # Check if authentication is required
             needs_auth = False
             try:
                 user_input = page.locator("input[name='username']").first
@@ -104,7 +216,7 @@ def render_card(beer_override=None):
                 if "/dashboard-entertainment" not in page.url:
                     page.goto(target_url, wait_until="networkidle", timeout=30000)
                 context.storage_state(path=AUTH_CACHE)
-                log("Authentication successful, session token cached.", level="AUTH")
+                log("Authentication successful, storage state saved.", level="AUTH")
 
             card = page.locator("perfectdraft-card, perfectdraft-pro-card, ha-card").first
             card.wait_for(state="visible", timeout=20000)
@@ -127,131 +239,44 @@ def render_card(beer_override=None):
     with open(DEBUG_RAW, "wb") as f:
         f.write(screenshot)
 
-    img = Image.open(io.BytesIO(screenshot)).convert("RGB")
-    img = img.resize((600, 400), Image.Resampling.LANCZOS)
-    px = img.load()
+    raw_img = Image.open(io.BytesIO(screenshot)).convert("RGB")
+    img = raw_img.resize((600, 400), Image.Resampling.LANCZOS)
 
-    # 1. Sample Background from Safe Margin (x: 20..40, y: 60..100)
-    sample_pts = [px[x, y] for x in (20, 30, 40) for y in (60, 80, 100)]
-    avg_r = sum(p[0] for p in sample_pts) / len(sample_pts)
-    avg_g = sum(p[1] for p in sample_pts) / len(sample_pts)
-    avg_b = sum(p[2] for p in sample_pts) / len(sample_pts)
+    # 1. Saturation Boost (brings muted web colors into active Spectra gamut)
+    img = ImageEnhance.Color(img).enhance(1.35)
 
-    bg_lum = 0.299 * avg_r + 0.587 * avg_g + 0.114 * avg_b
-    c_max = max(avg_r, avg_g, avg_b)
-    c_min = min(avg_r, avg_g, avg_b)
-    chroma = c_max - c_min
+    # 2. Midtone / Shadow Gamma Lift (prevents dark backgrounds from crushing into black)
+    inv_gamma = 1.0 / 1.55
+    gamma_lut = [int(pow(i / 255.0, inv_gamma) * 255.0 + 0.5) for i in range(256)]
+    img = img.point(gamma_lut * 3)
 
-    # 2. Brand & Text Contrast Classification
-    if chroma < 28:
-        if bg_lum < 85:
-            brand = "BLACK"
-            brand_solid = (0, 0, 0)
-        else:
-            brand = "WHITE"
-            brand_solid = (255, 255, 255)
-    else:
-        if c_max == avg_r:
-            hue = (60 * ((avg_g - avg_b) / chroma) + 360) % 360
-        elif c_max == avg_g:
-            hue = (60 * ((avg_b - avg_r) / chroma) + 120) % 360
-        else:
-            hue = (60 * ((avg_r - avg_g) / chroma) + 240) % 360
+    # 3. Sharpen font contours
+    img = ImageEnhance.Sharpness(img).enhance(1.4)
 
-        if hue >= 330 or hue < 25:
-            brand = "RED"
-            brand_solid = (255, 0, 0)
-        elif 25 <= hue < 75:
-            brand = "YELLOW"
-            brand_solid = (255, 255, 0)
-        elif 75 <= hue < 165:
-            brand = "GREEN"
-            brand_solid = (0, 255, 0)
-        else:
-            brand = "BLUE"
-            brand_solid = (0, 0, 255)
+    log(f"Processing '{beer_override or 'Live'}' via Edge-Preserving Atkinson...")
+    dithered_rgb, raw_indices = edge_preserving_atkinson(img)
 
-    log(f"Beer: '{beer_override or 'Live'}' | Brand: {brand} (Chroma: {chroma:.1f}, Lum: {bg_lum:.1f})")
+    # Save visual PNG preview for QA
+    dithered_rgb.save(OUTPUT_PNG, "PNG")
 
-    # 3. Deterministic Image Processing
-    for y in range(400):
-        for x in range(600):
-            r, g, b = px[x, y]
-            lum = 0.299 * r + 0.587 * g + 0.114 * b
-            px_chroma = max(r, g, b) - min(r, g, b)
-
-            if x < BANNER_WIDTH:
-                # Banner Region
-                if y >= 165:
-                    # Clean outer border radius margins
-                    if x < 12 or x > (BANNER_WIDTH - 8) or y > 388:
-                        px[x, y] = brand_solid
-                        continue
-
-                    dist_bg = abs(r - avg_r) + abs(g - avg_g) + abs(b - avg_b)
-
-                    if dist_bg < 42:
-                        px[x, y] = brand_solid
-                    else:
-                        if brand == "YELLOW" or brand == "WHITE":
-                            px[x, y] = (0, 0, 0)
-                        else:
-                            # Dark/Saturated banners: check for gold or red fonts
-                            if r > 130 and g > 105 and b < 105 and (r - b) > 35:
-                                px[x, y] = (255, 255, 0)
-                            elif r > 140 and g < 75 and b < 75:
-                                px[x, y] = (255, 0, 0)
-                            else:
-                                px[x, y] = (255, 255, 255)
-                else:
-                    # Keg Header Area (y < 165)
-                    dist_bg = abs(r - avg_r) + abs(g - avg_g) + abs(b - avg_b)
-                    if x < 50 or x > 190 or y < 25:
-                        px[x, y] = brand_solid
-                    else:
-                        if brand == "WHITE":
-                            if dist_bg < 60 and px_chroma < 30:
-                                px[x, y] = (255, 255, 255)
-                        else:
-                            if dist_bg < 45 and px_chroma < 35:
-                                px[x, y] = brand_solid
-            elif x == BANNER_WIDTH and brand == "WHITE":
-                # Clean 1px separation divider for white banners
-                px[x, y] = (0, 0, 0) if 10 <= y <= 390 else (255, 255, 255)
-            else:
-                # Right Panel: Glasses and Volume Text
-                if y > 310:
-                    px[x, y] = (0, 0, 0) if lum < 150 else (255, 255, 255)
-                elif r > 235 and g > 235 and b > 235:
-                    px[x, y] = (255, 255, 255)
-                else:
-                    if px_chroma < 25:
-                        dark_val = max(0, int(lum * 0.60))
-                        px[x, y] = (dark_val, dark_val, dark_val)
-                    else:
-                        deep_r = min(255, int(r * 1.20))
-                        deep_g = max(0, int(g * 0.90))
-                        deep_b = max(0, int(b * 0.35))
-                        px[x, y] = (deep_r, deep_g, deep_b)
-
-    # 4. Color Vibrancy & E-Ink Quantization
-    enhanced = ImageEnhance.Color(img).enhance(1.25)
-    enhanced = ImageEnhance.Contrast(enhanced).enhance(1.10)
-    enhanced = ImageEnhance.Sharpness(enhanced).enhance(1.20)
-
-    pal = Image.new("P", (1, 1))
-    pal.putpalette(PALETTE)
-
-    quantized = enhanced.quantize(palette=pal, dither=Image.Dither.FLOYDSTEINBERG)
-    quantized.convert("RGB").save(OUTPUT_PNG, "PNG")
-
-    # 5. Pack for Waveshare 7-Color Spectra 6 Format
+    # Rotate 270 degrees for Waveshare panel orientation
     try:
-        img_rot = quantized.transpose(Image.Transpose.ROTATE_270)
+        dithered_rot = dithered_rgb.transpose(Image.Transpose.ROTATE_270)
     except AttributeError:
-        img_rot = quantized.transpose(Image.ROTATE_270)
+        dithered_rot = dithered_rgb.transpose(Image.ROTATE_270)
 
-    raw_pixels = list(img_rot.getdata())
+    # Convert rotated image into palette indices for nibble packing
+    pal_img = Image.new("P", (1, 1))
+    flat_pal = []
+    for c in PALETTE_COLORS:
+        flat_pal.extend(c)
+    flat_pal += [0] * (768 - len(flat_pal))
+    pal_img.putpalette(flat_pal)
+
+    rot_quant = dithered_rot.quantize(palette=pal_img, dither=Image.Dither.NONE)
+    raw_pixels = list(rot_quant.getdata())
+
+    # Pack into 4-bit nibbles (2 pixels per byte)
     packed_bytes = bytearray(len(raw_pixels) // 2)
     for i in range(0, len(raw_pixels), 2):
         c1 = COLOR_MAP.get(raw_pixels[i], 0x1)
@@ -260,6 +285,8 @@ def render_card(beer_override=None):
 
     with open(OUTPUT_BIN, "wb") as f:
         f.write(packed_bytes)
+
+    log(f"Rendering complete: {OUTPUT_PNG} and {OUTPUT_BIN} updated.")
 
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_POST(self):
